@@ -199,8 +199,6 @@ void free_discretizer(Discretizer* disc) {
         free_tree(disc->root);
     }
 }
-
-// 主函数示例
 int main() {
     Discretizer disc;
     
