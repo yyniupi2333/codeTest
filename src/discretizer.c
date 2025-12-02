@@ -1,35 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <limits.h>
-#include <stdbool.h>
-
-#define MAX_GROUPS 64
-
-// 组结构体
-typedef struct Group {
-    int group_id;       // 组编号(0-63)
-    long long min;      // 组内最小值（改为long long防止溢出）
-    long long max;      // 组内最大值
-    int count;          // 组内数据个数
-    bool active;        // 组是否活跃（叶子节点）
-} Group;
-
-// 二叉树节点结构
-typedef struct TreeNode {
-    long long split_value;     // 分裂值（内部节点使用）
-    struct TreeNode* left;     // 左子树
-    struct TreeNode* right;    // 右子树
-    struct TreeNode* parent;   // 父节点指针，用于边界调整
-    Group* group;              // 叶子节点关联的组
-} TreeNode;
-
-// 离散化管理器
-typedef struct {
-    TreeNode* root;            // 二叉树根节点
-    Group groups[MAX_GROUPS];  // 所有组
-    int group_count;           // 当前组数
-    int next_group_id;         // 下一个可用的组ID
-} Discretizer;
+#include "../include/discretizer.h"
 
 // 初始化组
 void init_group(Group* group, int group_id) {
@@ -53,41 +24,27 @@ TreeNode* create_tree_node(long long split_value, Group* group) {
 
 // 检查组是否需要分裂
 bool need_split(const Group* group) {
-    if (group->count < 2) return false;
-    // 使用long long防止整数溢出
-    return group->max >= 2 * group->min;
+    if (group->count < MIN_COUNT) return false;
+
+    // 当最小值大于0时，使用比例判定
+    if (group->min > 0) {
+        return group->max >= (long long)THRESHOLD_RATIO * group->min;
+    } else if (group->min == 0) {
+        // 当 min == 0 时，用绝对跨度判断
+        return (group->max - group->min >= MIN_SPAN) && (group->max >= THRESHOLD_RATIO);
+    } else {
+        // min < 0 的情况（理论上不应发生，因为输入非负）
+        return false;
+    }
 }
 
-// 计算分裂点（整数几何平均近似）
+// 计算分裂点（纯整数二分法求几何平均近似，避免浮点数）
 long long calculate_split_point(long long min, long long max) {
-    // 处理min为0的情况
-    if (min == 0) {
-        // 当min为0时，使用算术平均作为fallback
-        return min + (max - min) / 2;
-    }
-    
-    // 使用二分法求整数平方根近似（避免浮点数）
-    long long left = min;
-    long long right = max;
-    long long result = min;
-    
-    while (left <= right) {
-        long long mid = left + (right - left) / 2;
-        long long square = mid * mid;
-        
-        if (square <= min * max) {
-            result = mid;
-            left = mid + 1;
-        } else {
-            right = mid - 1;
-        }
-    }
-    
-    // 确保分裂点在(min, max)范围内
-    if (result <= min) result = min + 1;
-    if (result >= max) result = max - 1;
-    
-    return result;
+    if (min >= max) return min;
+    if (min == 0) return (max - min) / 2;  // 当 min 为 0 时用算术中点
+
+    // 简单启发式：使用算术平均作为分裂点
+    return (min + max) / 2;
 }
 
 // 寻找最左叶子节点
@@ -173,7 +130,7 @@ bool split_group(Discretizer* disc, TreeNode* parent) {
     // 父节点不再是叶子节点
     parent->group->active = false;
     
-    // 重新分配父组中的数据到子组（简化：重置计数）
+    // 分裂后新组的数据从后续样本开始计数
     left_group->count = 0;
     right_group->count = 0;
     
@@ -186,7 +143,7 @@ bool split_group(Discretizer* disc, TreeNode* parent) {
     return true;
 }
 
-// 边界调整函数
+// 边界调整函数（当达到最大组数时，调整边界以更好地平衡两端）
 bool adjust_boundary(Discretizer* disc, TreeNode* edge_node, bool is_left_edge) {
     if (edge_node == NULL || edge_node->group == NULL || !edge_node->group->active) {
         return false;
@@ -194,9 +151,21 @@ bool adjust_boundary(Discretizer* disc, TreeNode* edge_node, bool is_left_edge) 
     
     Group* edge_group = edge_node->group;
     
-    // 只有达到调整阈值时才进行调整（例如，条件被严重违反）
-    if (edge_group->count < 2 || edge_group->max < 2 * edge_group->min * 11 / 10) {
-        return false; // 条件违反不严重，不调整
+    // 只有组内数据足够且违反条件时才调整
+    if (edge_group->count < MIN_COUNT) {
+        return false;
+    }
+    
+    // 检查是否违反 max < 2 * min 条件（考虑 min=0 的特殊情况）
+    bool violates = false;
+    if (edge_group->min > 0) {
+        violates = (edge_group->max >= 2 * edge_group->min);
+    } else if (edge_group->min == 0) {
+        violates = (edge_group->max >= 2);
+    }
+    
+    if (!violates) {
+        return false;  // 条件满足，无需调整
     }
     
     // 找到相邻的兄弟组
@@ -212,11 +181,28 @@ bool adjust_boundary(Discretizer* disc, TreeNode* edge_node, bool is_left_edge) 
     
     Group* sibling_group = sibling_node->group;
     
-    printf("边界调整: %s边缘组 %d (min=%lld, max=%lld)\n", 
-           is_left_edge ? "左" : "右", edge_group->group_id, edge_group->min, edge_group->max);
+    printf("边界调整: %s边缘组 %d (min=%lld, max=%lld, count=%d)\n", 
+           is_left_edge ? "左" : "右", edge_group->group_id, edge_group->min, edge_group->max, edge_group->count);
     
-    // 计算新的分裂点
-    long long new_split_point = calculate_split_point(edge_group->min, edge_group->max);
+    // 改进版：基于实际数据分布计算分裂点
+    long long new_split_point;
+    long long edge_span = edge_group->max - edge_group->min;
+    
+    if (edge_group->count + sibling_group->count > 0 && edge_span > 1) {
+        // 按数据量比例：edge占比 = edge->count / (edge->count + sibling->count)
+        long long total_count = edge_group->count + sibling_group->count;
+        long long edge_proportion = (edge_group->count * 100) / total_count;
+        
+        // 分裂点位置由数据占比决定
+        new_split_point = edge_group->min + (edge_span * edge_proportion) / 100;
+    } else {
+        // 降级：使用中点
+        new_split_point = (edge_group->min + edge_group->max) / 2;
+    }
+    
+    // 确保分裂点在有效范围内
+    if (new_split_point <= edge_group->min) new_split_point = edge_group->min + 1;
+    if (new_split_point >= edge_group->max) new_split_point = edge_group->max - 1;
     
     // 更新分裂点和组范围
     long long old_split = parent_node->split_value;
@@ -237,8 +223,24 @@ bool adjust_boundary(Discretizer* disc, TreeNode* edge_node, bool is_left_edge) 
 
 // 统一的查询和更新函数
 int query_and_update(Discretizer* disc, long long value) {
-    TreeNode* current = disc->root;
+    if (disc == NULL || disc->root == NULL) return -1;
+
+    // 第一个值到达时初始化
+    if (!disc->initialized) {
+        initialize_with_first_value(disc, value);
+    }
     
+    // 若值超出当前根节点范围，需要扩展根节点
+    Group* root_group = disc->root->group;
+    if (value < root_group->min) {
+        root_group->min = value;
+    }
+    if (value > root_group->max) {
+        root_group->max = value;
+    }
+
+    TreeNode* current = disc->root;
+
     // 遍历二叉树找到合适的叶子节点
     while (current != NULL) {
         if (current->group != NULL && current->group->active) {
@@ -256,28 +258,56 @@ int query_and_update(Discretizer* disc, long long value) {
             }
             group->count++;
             
-            // 检查是否需要分裂或边界调整
+            // 检查是否需要分裂
             if (disc->group_count < MAX_GROUPS) {
                 if (need_split(group)) {
                     split_group(disc, current);
                 }
             } else {
-                // 达到最大组数，进行边界调整
-                TreeNode* leftmost = find_leftmost_leaf(disc->root);
-                TreeNode* rightmost = find_rightmost_leaf(disc->root);
+                // 达到最大组数，进行迭代边界微调以逐步优化分组
+                int adjust_iterations = 0;
+                const int MAX_ADJUST_ITERATIONS = 3;
                 
-                if (leftmost != NULL && leftmost->group != NULL) {
-                    adjust_boundary(disc, leftmost, true);
+                while (adjust_iterations < MAX_ADJUST_ITERATIONS) {
+                    bool any_adjusted = false;
+                    
+                    TreeNode* leftmost = find_leftmost_leaf(disc->root);
+                    TreeNode* rightmost = find_rightmost_leaf(disc->root);
+                    
+                    // 优先调整两端边缘
+                    if (leftmost != NULL && leftmost->group != NULL && leftmost != rightmost) {
+                        if (adjust_boundary(disc, leftmost, true)) {
+                            any_adjusted = true;
+                        }
+                    }
+                    
+                    if (rightmost != NULL && rightmost->group != NULL && rightmost != leftmost) {
+                        if (adjust_boundary(disc, rightmost, false)) {
+                            any_adjusted = true;
+                        }
+                    }
+                    
+                    // 若本轮无调整，停止迭代
+                    if (!any_adjusted) break;
+                    
+                    adjust_iterations++;
                 }
                 
-                if (rightmost != NULL && rightmost->group != NULL) {
-                    adjust_boundary(disc, rightmost, false);
+                if (adjust_iterations > 0) {
+                    printf("迭代调整完成: %d次迭代\n", adjust_iterations);
                 }
             }
             
             return group_id;
+        } else if (current->group == NULL) {
+            // 内部节点（group为NULL）：根据分裂值决定方向
+            if (value < current->split_value) {
+                current = current->left;
+            } else {
+                current = current->right;
+            }
         } else {
-            // 内部节点：根据分裂值决定方向
+            // 不活跃的节点（已分裂），继续遍历子树
             if (value < current->split_value) {
                 current = current->left;
             } else {
@@ -286,21 +316,34 @@ int query_and_update(Discretizer* disc, long long value) {
         }
     }
     
-    return -1; // 未找到合适的组
+    return -1;
 }
 
-// 初始化离散化器
+// 初始化离散化器（创建临时根节点，等待第一个值到达后真正初始化）
 void init_discretizer(Discretizer* disc, long long initial_min, long long initial_max) {
     disc->group_count = 1;
     disc->next_group_id = 1;
+    disc->initialized = false;
     
-    // 初始化第一个组
+    // 创建临时根组（范围待定）
     init_group(&disc->groups[0], 0);
-    disc->groups[0].min = initial_min;
-    disc->groups[0].max = initial_max;
+    disc->groups[0].min = LLONG_MAX;
+    disc->groups[0].max = LLONG_MIN;
     
     // 创建根节点
     disc->root = create_tree_node(0, &disc->groups[0]);
+}
+
+// 第一个值到达时，根据该值初始化根节点范围
+void initialize_with_first_value(Discretizer* disc, long long first_value) {
+    if (disc->initialized) return;
+    
+    // 设置初始范围为 [first_value, first_value]
+    disc->groups[0].min = first_value;
+    disc->groups[0].max = first_value;
+    disc->initialized = true;
+    
+    printf("初始化根节点范围: [%lld, %lld]\n", first_value, first_value);
 }
 
 // 查询数值所属的组编号（不更新统计信息）
@@ -347,52 +390,4 @@ void free_tree(TreeNode* node) {
     free_tree(node->left);
     free_tree(node->right);
     free(node);
-}
-
-// 主函数示例
-int main() {
-    Discretizer disc;
-    
-    // 初始化，使用整数范围[0, INT_MAX]
-    init_discretizer(&disc, 0, INT_MAX);
-    
-    // 测试数据（整数序列）
-    long long test_data[] = {
-        1, 2, 3, 5, 8, 13, 21, 34, 55, 89,
-        144, 233, 377, 610, 987, 1597, 2584, 4181,
-        6765, 10946, 17711, 28657, 46368, 75025,
-        121393, 196418, 317811, 514229, 832040
-    };
-    
-    int data_count = sizeof(test_data) / sizeof(test_data[0]);
-    
-    printf("开始整数离散化处理...\n");
-    printf("目标组数: %d, 每组需满足 max < 2 * min\n", MAX_GROUPS);
-    printf("初始范围: [0, %d]\n", INT_MAX);
-    
-    // 处理数据流
-    for (int i = 0; i < data_count; i++) {
-        if (disc.group_count >= MAX_GROUPS) {
-            printf("已达到最大组数 %d，启用边界调整模式\n", MAX_GROUPS);
-            // 继续处理，但只进行边界调整
-        }
-        
-        int assigned_group = query_and_update(&disc, test_data[i]);
-        printf("处理值 %8lld -> 组 %d, 当前组数: %d\n", 
-               test_data[i], assigned_group, disc.group_count);
-    }
-    
-    // 打印最终结果
-    print_groups(&disc);
-    
-    // 测试查询功能
-    printf("\n纯查询测试（不更新统计）:\n");
-    long long test_values[] = {10, 100, 1000, 10000, 50000, 100000, 500000};
-    for (int i = 0; i < sizeof(test_values) / sizeof(test_values[0]); i++) {
-        int group_id = find_group_id(&disc, test_values[i]);
-        printf("值 %8lld 属于组 %d\n", test_values[i], group_id);
-    }
-    free_tree(disc.root);
-    
-    return 0;
 }
